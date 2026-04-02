@@ -1,12 +1,22 @@
 import json
 import os
+from datetime import date
+
 import requests
 
-_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-_API_URL = f"https://api.telegram.org/bot{_TOKEN}/sendMessage"
-
 _ESCAPE_CHARS = r"\_*[]()~`>#+-=|{}.!"
+
+# One session for the lifetime of the process — reuses TCP connections across a batch.
+_session = requests.Session()
+
+
+def _api_url() -> str:
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    return f"https://api.telegram.org/bot{token}/sendMessage"
+
+
+def _chat_id() -> str:
+    return os.environ["TELEGRAM_CHAT_ID"]
 
 
 def _esc(text: str) -> str:
@@ -47,16 +57,15 @@ def format_message(job: dict) -> str:
 
 
 def send_heartbeat(jobs_checked: int) -> bool:
-    from datetime import date
     text = (
         f"✅ Scraper ran — no new jobs today\\.\n"
         f"📊 {jobs_checked} listings checked · {_esc(date.today().isoformat())}"
     )
     try:
-        resp = requests.post(
-            _API_URL,
+        resp = _session.post(
+            _api_url(),
             json={
-                "chat_id": _CHAT_ID,
+                "chat_id": _chat_id(),
                 "text": text,
                 "parse_mode": "MarkdownV2",
                 "disable_web_page_preview": True,
@@ -71,10 +80,10 @@ def send_heartbeat(jobs_checked: int) -> bool:
 def send_notification(job: dict) -> bool:
     text = format_message(job)
     try:
-        resp = requests.post(
-            _API_URL,
+        resp = _session.post(
+            _api_url(),
             json={
-                "chat_id": _CHAT_ID,
+                "chat_id": _chat_id(),
                 "text": text,
                 "parse_mode": "MarkdownV2",
                 "disable_web_page_preview": True,
