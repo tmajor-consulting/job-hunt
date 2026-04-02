@@ -130,6 +130,16 @@ iframe { border-radius: 10px !important; }
 /* Divider */
 hr { border-color: #334155 !important; }
 
+/* Compact icon buttons (edit/delete in timeline) */
+[data-testid="stButton"] button[title="Edit step"],
+[data-testid="stButton"] button[title="Delete step"] {
+    padding: 2px 4px !important;
+    font-size: 11px !important;
+    min-height: 0 !important;
+    height: 26px !important;
+    line-height: 1 !important;
+}
+
 /* Sidebar nav radio */
 [data-testid="stSidebar"] [data-testid="stRadio"] label {
     color: #94a3b8 !important;
@@ -235,11 +245,42 @@ def get_applications(conn) -> pd.DataFrame:
 
 def get_events(conn, app_id: int) -> list[dict]:
     rows = conn.execute(
-        "SELECT stage, event_date, notes FROM application_events "
+        "SELECT id, stage, event_date, notes FROM application_events "
         "WHERE application_id = ? ORDER BY event_date ASC",
         (app_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def update_event(conn, event_id: int, app_id: int, stage: str, event_date: str, notes: str) -> None:
+    conn.execute(
+        "UPDATE application_events SET stage=?, event_date=?, notes=? WHERE id=?",
+        (stage, event_date, notes or None, event_id),
+    )
+    latest = conn.execute(
+        "SELECT stage, event_date FROM application_events WHERE application_id=? ORDER BY event_date DESC LIMIT 1",
+        (app_id,),
+    ).fetchone()
+    if latest:
+        conn.execute(
+            "UPDATE applications SET current_stage=?, updated_at=? WHERE id=?",
+            (latest["stage"], latest["event_date"], app_id),
+        )
+    conn.commit()
+
+
+def delete_event(conn, event_id: int, app_id: int) -> None:
+    conn.execute("DELETE FROM application_events WHERE id=?", (event_id,))
+    latest = conn.execute(
+        "SELECT stage, event_date FROM application_events WHERE application_id=? ORDER BY event_date DESC LIMIT 1",
+        (app_id,),
+    ).fetchone()
+    if latest:
+        conn.execute(
+            "UPDATE applications SET current_stage=?, updated_at=? WHERE id=?",
+            (latest["stage"], latest["event_date"], app_id),
+        )
+    conn.commit()
 
 
 # ── Views ─────────────────────────────────────────────────────────────────────
@@ -301,14 +342,17 @@ def view_dashboard(conn):
         return
 
     # ── Search + filter ──
-    fc1, fc2 = st.columns([3, 2])
+    fc1, fc2, fc3 = st.columns([3, 2, 1], vertical_alignment="bottom")
     search = fc1.text_input("", placeholder="🔍  Search company or title...", label_visibility="collapsed")
     stage_filter = fc2.multiselect("", options=STAGE_KEYS,
                                    format_func=lambda k: STAGE_MAP[k],
                                    placeholder="Filter by stage",
                                    label_visibility="collapsed")
+    open_only = fc3.toggle("Open only", value=False)
 
     filtered = df.copy()
+    if open_only:
+        filtered = filtered[filtered["current_stage"].isin(ACTIVE_STAGES)]
     if search:
         mask = (filtered["company"].str.contains(search, case=False, na=False) |
                 filtered["title"].str.contains(search, case=False, na=False))
@@ -356,17 +400,54 @@ def view_dashboard(conn):
                     for i, ev in enumerate(events):
                         color = STAGE_COLORS.get(ev["stage"], "#6b7280")
                         connector = "│" if i < len(events) - 1 else " "
-                        note_str = f" — {ev['notes']}" if ev.get("notes") else ""
-                        st.markdown(
-                            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:2px;">'
-                            f'<span style="color:{color};font-size:18px;">●</span>'
-                            f'<span style="color:#e2e8f0;font-size:13px;">'
-                            f'{STAGE_MAP.get(ev["stage"], ev["stage"])}</span>'
-                            f'<span style="color:#64748b;font-size:12px;">{ev["event_date"]}{note_str}</span>'
-                            f'</div>'
-                            f'<div style="margin-left:9px;color:#334155;font-size:11px;">{connector}</div>',
-                            unsafe_allow_html=True,
-                        )
+                        is_editing_ev = st.session_state.get("editing_event") == ev["id"]
+
+                        if is_editing_ev:
+                            ec1, ec2, ec3, ec4 = st.columns([2, 2, 3, 1])
+                            edit_stage = ec1.selectbox(
+                                "Stage", STAGE_KEYS, format_func=lambda k: STAGE_MAP[k],
+                                index=STAGE_KEYS.index(ev["stage"]) if ev["stage"] in STAGE_KEYS else 0,
+                                key=f"edit_stage_{ev['id']}", label_visibility="collapsed",
+                            )
+                            edit_date = ec2.date_input(
+                                "Date", value=date.fromisoformat(ev["event_date"]),
+                                key=f"edit_date_{ev['id']}", label_visibility="collapsed",
+                            )
+                            edit_notes = ec3.text_input(
+                                "Notes", value=ev.get("notes") or "",
+                                key=f"edit_notes_{ev['id']}", label_visibility="collapsed",
+                                placeholder="Notes...",
+                            )
+                            with ec4:
+                                if st.button("Save", key=f"edit_save_{ev['id']}", type="primary", use_container_width=True):
+                                    update_event(conn, ev["id"], row["id"], edit_stage, str(edit_date), edit_notes)
+                                    st.session_state.pop("editing_event", None)
+                                    st.rerun()
+                                if st.button("Cancel", key=f"edit_cancel_{ev['id']}", use_container_width=True):
+                                    st.session_state.pop("editing_event", None)
+                                    st.rerun()
+                        else:
+                            note_str = f" — {ev['notes']}" if ev.get("notes") else ""
+                            dc1, dc2, dc3 = st.columns([8, 0.6, 0.6])
+                            with dc1:
+                                st.markdown(
+                                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:2px;">'
+                                    f'<span style="color:{color};font-size:18px;">●</span>'
+                                    f'<span style="color:#e2e8f0;font-size:13px;">'
+                                    f'{STAGE_MAP.get(ev["stage"], ev["stage"])}</span>'
+                                    f'<span style="color:#64748b;font-size:12px;">{ev["event_date"]}{note_str}</span>'
+                                    f'</div>'
+                                    f'<div style="margin-left:9px;color:#334155;font-size:11px;">{connector}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            with dc2:
+                                if st.button("✏️", key=f"edit_btn_{ev['id']}", help="Edit step", use_container_width=True):
+                                    st.session_state["editing_event"] = ev["id"]
+                                    st.rerun()
+                            with dc3:
+                                if st.button("🗑", key=f"del_btn_{ev['id']}", help="Delete step", use_container_width=True):
+                                    delete_event(conn, ev["id"], row["id"])
+                                    st.rerun()
 
                 if row.get("notes"):
                     st.markdown(
@@ -376,8 +457,8 @@ def view_dashboard(conn):
                     )
 
                 st.markdown("&nbsp;", unsafe_allow_html=True)
-                st.markdown("**Update stage**")
-                uc1, uc2, uc3 = st.columns([2, 2, 1])
+                st.markdown("**Add stage**")
+                uc1, uc2, uc3, uc4 = st.columns([2, 2, 3, 1], vertical_alignment="bottom")
                 new_stage = uc1.selectbox("Stage", STAGE_KEYS,
                                           format_func=lambda k: STAGE_MAP[k],
                                           key=f"ns_{row['id']}",
@@ -385,12 +466,13 @@ def view_dashboard(conn):
                 event_date = uc2.date_input("Date", value=date.today(),
                                             key=f"nd_{row['id']}",
                                             label_visibility="collapsed")
-                with uc3:
-                    st.write("")
-                    if st.button("Save", key=f"save_{row['id']}", type="primary", use_container_width=True):
-                        add_event(conn, row["id"], new_stage, str(event_date), "")
-                        st.toast("Stage updated!", icon="✅")
-                        st.rerun()
+                new_notes = uc3.text_input("Notes", key=f"nn_{row['id']}",
+                                           label_visibility="collapsed",
+                                           placeholder="Notes (optional)...")
+                if uc4.button("Add", key=f"save_{row['id']}", type="primary", use_container_width=True):
+                    add_event(conn, row["id"], new_stage, str(event_date), new_notes)
+                    st.toast("Stage added!", icon="✅")
+                    st.rerun()
 
                 with st.expander("🗑 Delete application"):
                     if st.button("Confirm delete", key=f"del_{row['id']}", type="secondary"):
